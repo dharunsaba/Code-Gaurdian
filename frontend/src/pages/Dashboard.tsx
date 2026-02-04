@@ -232,12 +232,12 @@ const Dashboard: React.FC = () => {
 
           {/* Flaw Report Card */}
           {flawReport && (
-            <div className="p-3 rounded-lg bg-card border border-amber-500/20 space-y-1.5">
+            <div className="p-3 rounded-none border-2 border-amber-500/20 space-y-1.5 bg-card">
               <div className="flex items-center gap-1.5">
                 <AlertCircle className="w-3.5 h-3.5 text-amber-500" />
                 <h3 className="text-xs font-semibold text-foreground">Flaw Report</h3>
               </div>
-              <div className="text-xs text-muted-foreground whitespace-pre-wrap bg-secondary/50 p-2 rounded max-h-28 overflow-y-auto leading-relaxed">
+              <div className="text-xs text-muted-foreground whitespace-pre-wrap bg-secondary/50 p-2 rounded-none max-h-28 overflow-y-auto leading-relaxed border border-border">
                 {flawReport}
               </div>
             </div>
