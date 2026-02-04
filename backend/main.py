@@ -162,74 +162,99 @@ def get_history(user_id: int, db: Session = Depends(get_db)):
 
 @app.post("/optimize", response_model=OptimizationResult)
 def optimize_code(req: CodeRequest, db: Session = Depends(get_db)):
-    cli_instruction = (
-        "\nInclude command-line usage examples."
-        if req.include_cli
-        else ""
+    # 1. Check cache for existing optimization
+    cached_entry = db.scalar(
+        select(models.History)
+        .where(models.History.code_snippet == req.code)
+        .where(models.History.language == req.language)
+        .order_by(models.History.created_at.desc())
     )
 
-    prompt = (
-        "You are a senior software engineer performing static code analysis.\n\n"
-        "Return EXACTLY two sections.\n\n"
-        "RULES FOR FLAW REPORT:\n"
-        "- MAX 9 lines\n"
-        "- Headings ONLY\n"
-        "- Each line must include line ranges like: line 5–10\n"
-        "- Format: **Issue Name** — line X–Y\n"
-        "- No explanations. No bullets.\n"
-        f"{cli_instruction}\n\n"
-        "FORMAT:\n\n"
-        "---OPTIMIZED CODE---\n"
-        "[optimized code only]\n\n"
-        "---FLAW REPORT---\n"
-        "**Issue name** — line X–Y\n"
-        "**Issue name** — line X–Y\n\n"
-        "Code:\n"
-        f"{req.language}\n"
-        f"{req.code}\n"
-    )
+    optimized_content = ""
+    flaw_report = ""
+    used_cache = False
 
-    try:
-        response = gemini_model.generate_content(prompt)
-        
-        full_response = response.text.strip()
-        logger.debug(f"Raw Gemini response: {full_response[:500]}...")
-        
-        optimized_content = ""
-        flaw_report = ""
-        
-        separators = [
-            ("---OPTIMIZED CODE---", "---FLAW REPORT---"),
-            ("OPTIMIZED CODE:", "FLAW REPORT:"),
-            ("**OPTIMIZED CODE**", "**FLAW REPORT**"),
-        ]
-        
-        parsed = False
-        for opt_sep, flaw_sep in separators:
-            if opt_sep in full_response and flaw_sep in full_response:
-                parts = full_response.split(flaw_sep)
-                optimized_part = parts[0].replace(opt_sep, "").strip()
-                flaw_report = parts[1].strip()
-                
-                if optimized_part.startswith("```"):
-                    lines = optimized_part.split("\n")
-                    if len(lines) > 1 and lines[-1].strip().startswith("```"):
-                        optimized_content = "\n".join(lines[1:-1]).strip()
+    if cached_entry and cached_entry.optimized_code:
+        logger.info(f"Cache hit for code snippet. Using result from History ID: {cached_entry.id}")
+        optimized_content = cached_entry.optimized_code
+        flaw_report = cached_entry.flaw_report or ""
+        used_cache = True
+    else:
+        # 2. Call Gemini API if not in cache
+        cli_instruction = (
+            "\nInclude command-line usage examples."
+            if req.include_cli
+            else ""
+        )
+
+        prompt = (
+            "You are a senior software engineer performing static code analysis.\n\n"
+            "Return EXACTLY two sections.\n\n"
+            "RULES FOR FLAW REPORT:\n"
+            "- MAX 9 lines\n"
+            "- Headings ONLY\n"
+            "- Each line must include line ranges like: line 5–10\n"
+            "- Format: **Issue Name** — line X–Y\n"
+            "- No explanations. No bullets.\n"
+            f"{cli_instruction}\n\n"
+            "FORMAT:\n\n"
+            "---OPTIMIZED CODE---\n"
+            "[optimized code only]\n\n"
+            "---FLAW REPORT---\n"
+            "**Issue name** — line X–Y\n"
+            "**Issue name** — line X–Y\n\n"
+            "Code:\n"
+            f"{req.language}\n"
+            f"{req.code}\n"
+        )
+
+        try:
+            response = gemini_model.generate_content(prompt)
+            
+            full_response = response.text.strip()
+            logger.debug(f"Raw Gemini response: {full_response[:500]}...")
+            
+            separators = [
+                ("---OPTIMIZED CODE---", "---FLAW REPORT---"),
+                ("OPTIMIZED CODE:", "FLAW REPORT:"),
+                ("**OPTIMIZED CODE**", "**FLAW REPORT**"),
+            ]
+            
+            parsed = False
+            for opt_sep, flaw_sep in separators:
+                if opt_sep in full_response and flaw_sep in full_response:
+                    parts = full_response.split(flaw_sep)
+                    optimized_part = parts[0].replace(opt_sep, "").strip()
+                    flaw_report = parts[1].strip()
+                    
+                    if optimized_part.startswith("```"):
+                        lines = optimized_part.split("\n")
+                        if len(lines) > 1 and lines[-1].strip().startswith("```"):
+                            optimized_content = "\n".join(lines[1:-1]).strip()
+                        else:
+                            optimized_content = "\n".join(lines[1:]).strip()
                     else:
-                        optimized_content = "\n".join(lines[1:]).strip()
-                else:
-                    optimized_content = optimized_part
-                
-                parsed = True
-                logger.info(f"Successfully parsed response using separators: {opt_sep} / {flaw_sep}")
-                break
-        
-        if not parsed:
-            optimized_content = full_response
-            flaw_report = "Unable to extract flaw analysis."
-            logger.warning("Failed to parse Gemini response with expected format.")
+                        optimized_content = optimized_part
+                    
+                    parsed = True
+                    logger.info(f"Successfully parsed response using separators: {opt_sep} / {flaw_sep}")
+                    break
+            
+            if not parsed:
+                optimized_content = full_response
+                flaw_report = "Unable to extract flaw analysis."
+                logger.warning("Failed to parse Gemini response with expected format.")
 
-        if req.user_id:
+        except Exception as e:
+            logger.exception(f"Optimization error: {e}")
+            raise HTTPException(500, "Code optimization failed")
+
+    # 3. Save to user history (even if cached, so it shows in their timeline)
+    if req.user_id:
+        # Avoid duplicates in history? User asked to "check that code from db... instead of wasting tokens"
+        # but likely wants it in their history.
+        # We will save it so they see it in their recent list.
+        try:
             user_exists = db.scalar(select(models.User.id).where(models.User.id == req.user_id))
             if user_exists:
                 db_history = models.History(
@@ -241,16 +266,15 @@ def optimize_code(req: CodeRequest, db: Session = Depends(get_db)):
                 )
                 db.add(db_history)
                 db.commit()
-                logger.info(f"Optimization for user {req.user_id} saved to history.")
+                logger.info(f"Optimization for user {req.user_id} saved to history. (Cached: {used_cache})")
+        except Exception as e:
+            logger.error(f"Failed to save history: {e}")
+            # Non-blocking error for history saving
 
-        return OptimizationResult(
-            optimized_code=optimized_content,
-            flaw_report=flaw_report
-        )
-    
-    except Exception as e:
-        logger.exception(f"Optimization error: {e}")
-        raise HTTPException(500, "Code optimization failed")
+    return OptimizationResult(
+        optimized_code=optimized_content,
+        flaw_report=flaw_report
+    )
 
 
 if __name__ == "__main__":
